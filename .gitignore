@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env files (keep secrets out of git)
+.env
+.env.*
+!.env.example
+
+# Virtual envs
+.venv/
+venv/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Local runtime / storage
+mlruns/
+data/
+
+# OS junk
+.DS_Store
+
+# Sample / test documents
+*.pdf
