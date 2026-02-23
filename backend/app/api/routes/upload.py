@@ -40,38 +40,57 @@ async def upload_pdf(
         },
     )
 
-    # default response (upload-only)
     resp = UploadResponse(file_id=file_id, filename=file.filename)
 
-    # optional ingest
     if ingest:
-        pages = extract_pdf_text_by_page(out_path)
+        try:
+            pages = extract_pdf_text_by_page(out_path)
 
-        docs = chunk_pages(
-            pages,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-            source_name=out_path.name,
-            file_id=file_id,
-            tenant_id=tenant_id,
-        )
+            docs = chunk_pages(
+                pages,
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+                source_name=out_path.name,
+                file_id=file_id,
+                tenant_id=tenant_id,
+            )
 
-        with Timer() as t:
-            num_added = upsert_docs(docs)
+            with Timer() as t:
+                num_added = upsert_docs(docs)
 
-        log_ingest(
-            file_id=file_id,
-            filename=out_path.name,
-            num_pages=len(pages),
-            num_chunks=num_added,
-            chunk_size=settings.chunk_size,
-            overlap=settings.chunk_overlap,
-            collection=settings.collection_name,
-            elapsed=t.dt,
-        )
+            log_ingest(
+                file_id=file_id,
+                filename=out_path.name,
+                num_pages=len(pages),
+                num_chunks=num_added,
+                chunk_size=settings.chunk_size,
+                overlap=settings.chunk_overlap,
+                collection=settings.collection_name,
+                elapsed=t.dt,
+            )
 
-        resp.ingested = True
-        resp.num_pages = len(pages)
-        resp.num_chunks = num_added
+            resp.ingested = True
+            resp.num_pages = len(pages)
+            resp.num_chunks = num_added
+
+        except Exception as e:
+            msg = str(e)
+
+            # Quota / rate limit
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Gemini embedding quota/rate limit hit during ingest. "
+                        "Please retry in ~30 seconds, or increase batch settings / billing. "
+                        f"Raw: {msg}"
+                    ),
+                )
+
+            # Any other ingest failure
+            raise HTTPException(
+                status_code=500,
+                detail=f"Ingest failed: {msg}",
+            )
 
     return resp

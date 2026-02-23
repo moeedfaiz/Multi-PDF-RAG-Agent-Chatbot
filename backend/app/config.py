@@ -1,70 +1,77 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
-from pathlib import Path
-from typing import Optional
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query
+import uuid
+from datetime import datetime
+
+from ...config import settings
+from ...deps import get_tenant_id
+from ...schemas.upload import UploadResponse
+from ...services.registry import append_record
+from ...services.pdf_loader import extract_pdf_text_by_page
+from ...services.chunker import chunk_pages
+from ...services.vectorstore import upsert_docs
+from ...services.mlflow_logger import Timer, log_ingest
+
+router = APIRouter()
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
+@router.post("/upload", response_model=UploadResponse)
+async def upload_pdf(
+    file: UploadFile = File(...),
+    tenant_id: str = Depends(get_tenant_id),
+    ingest: bool = Query(False),
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    file_id = str(uuid.uuid4())
+    out_path = settings.uploads_dir / f"{file_id}.pdf"
+    out_path.write_bytes(await file.read())
+
+    append_record(
+        settings.app_data_dir,
+        {
+            "tenant_id": tenant_id,
+            "file_id": file_id,
+            "filename": file.filename,
+            "stored_name": out_path.name,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        },
     )
 
-    # -------------------------
-    # Infra
-    # -------------------------
-    qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
-    mlflow_tracking_uri: str = Field(default="http://localhost:5000", alias="MLFLOW_TRACKING_URI")
-    app_data_dir: Path = Field(default=Path("../data"), alias="APP_DATA_DIR")
-    collection_name: str = Field(default="pdf_chunks", alias="COLLECTION_NAME")
+    # default response (upload-only)
+    resp = UploadResponse(file_id=file_id, filename=file.filename)
 
-    # -------------------------
-    # RAG Settings
-    # -------------------------
-    chunk_size: int = Field(default=900, alias="CHUNK_SIZE")
-    chunk_overlap: int = Field(default=150, alias="CHUNK_OVERLAP")
-    rag_max_distance: float = Field(default=0.35, alias="RAG_MAX_DISTANCE")
+    # optional ingest
+    if ingest:
+        pages = extract_pdf_text_by_page(out_path)
 
-    # -------------------------
-    # API Keys
-    # -------------------------
-    api_keys_json: str = Field(default='{"dev-key":"demo"}', alias="API_KEYS_JSON")
+        docs = chunk_pages(
+            pages,
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+            source_name=out_path.name,
+            file_id=file_id,
+            tenant_id=tenant_id,
+        )
 
-    # -------------------------
-    # LLM Provider (chat)
-    # -------------------------
-    llm_provider: str = Field(default="ollama", alias="LLM_PROVIDER")  # ollama | gemini
+        with Timer() as t:
+            num_added = upsert_docs(docs)
 
-    # -------------------------
-    # Embeddings Provider (vector DB)
-    # IMPORTANT: This is what fixes your Railway Ollama timeout
-    # -------------------------
-    embeddings_provider: str = Field(default="ollama", alias="EMBEDDINGS_PROVIDER")  # ollama | gemini
+        log_ingest(
+            file_id=file_id,
+            filename=out_path.name,
+            num_pages=len(pages),
+            num_chunks=num_added,
+            chunk_size=settings.chunk_size,
+            overlap=settings.chunk_overlap,
+            collection=settings.collection_name,
+            elapsed=t.dt,
+        )
 
-    # -------------------------
-    # Ollama (local)
-    # -------------------------
-    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
-    ollama_model: str = Field(default="phi3:mini", alias="OLLAMA_MODEL")
-    ollama_embed_model: str = Field(default="nomic-embed-text", alias="OLLAMA_EMBED_MODEL")
+        resp.ingested = True
+        resp.num_pages = len(pages)
+        resp.num_chunks = num_added
 
-    # -------------------------
-    # Gemini (prod)
-    # -------------------------
-    gemini_api_key: Optional[str] = Field(default=None, alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-1.5-flash", alias="GEMINI_MODEL")
-
-    # Gemini embeddings model (default is a good one)
-    gemini_embed_model: str = Field(default="models/text-embedding-004", alias="GEMINI_EMBED_MODEL")
-
-    @property
-    def uploads_dir(self) -> Path:
-        return self.app_data_dir / "uploads"
-
-    @property
-    def parsed_dir(self) -> Path:
-        return self.app_data_dir / "parsed"
-
-
-settings = Settings()
+    return resp
